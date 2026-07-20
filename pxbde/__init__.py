@@ -29,6 +29,7 @@ from pxbde.core import (
     insert_rows_batch_by_table,
     list_tables,
     pack_paradox_table,
+    update_secondary_indexes_incremental,
     paradox_secondary_files,
     quarantine_secondary_indexes,
     rebuild_primary_index,
@@ -36,7 +37,7 @@ from pxbde.core import (
     secondary_index_pairs,
 )
 
-__version__ = "1.0.0"
+__version__ = "1.1.0"
 
 __all__ = [
     "ParadoxIndexWriteError",
@@ -52,6 +53,7 @@ __all__ = [
     "quarantine_secondary_indexes",
     "rebuild_primary_index",
     "rebuild_secondary_indexes",
+    "update_secondary_indexes_incremental",
     "secondary_index_pairs",
     "__version__",
 ]

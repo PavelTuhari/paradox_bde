@@ -529,16 +529,19 @@ def _physical_block_numbers(
 
 
 def _sort_key_paradox(values: tuple, sortorder: int, encoding: str):
-    """Ключ сортировки Paradox: NULL первым; Alpha — по байтам кодировки."""
+    """
+    Ключ сортировки Paradox: NULL первым; Alpha — ПО СЫРЫМ БАЙТАМ кодировки
+    БЕЗ upper(): драйвер 'cyrr' (0xC0) сортирует case-SENSITIVE по байтам
+    cp866 (A-Z < a-z < А-Я < а-я). Проверено побайтово на эталоне UNA:
+    upper() ломал порядок X03/XG2 (Iphone < Macbook < iPhone) → бинарный
+    поиск BDE по индексу перестаёт находить записи.
+    """
     parts = []
     for v in values:
         if v is None:
             parts.append((0, b""))
         elif isinstance(v, str):
-            raw = v.encode(encoding, errors="replace")
-            if sortorder == 0xC0:  # intl: без учёта регистра (BDE 'INTL')
-                raw = raw.upper()
-            parts.append((1, raw))
+            parts.append((1, v.encode(encoding, errors="replace")))
         elif isinstance(v, bool):
             parts.append((1, int(v)))
         else:
@@ -781,6 +784,207 @@ def _rebuild_px_from_base(px_path: Path, base_path: Path) -> None:
     out[0x20] = levels
     out[0x3A:0x3C] = n_blocks.to_bytes(2, "little")
     px_path.write_bytes(bytes(out))
+
+
+def update_secondary_indexes_incremental(
+    db_file: str | Path,
+    *,
+    encoding: str = "cp866",
+    log: ProgressCb | None = None,
+) -> list[Path]:
+    """
+    Инкрементальное обновление вторичных индексов с СОХРАНЕНИЕМ порядка
+    записей X-файлов (безопасно для «старых» таблиц с историческим
+    порядком BDE — 1ms_univers и т.п., где полная пересборка ломает поиск).
+
+    Для каждого X: существующие записи остаются в своём порядке;
+    Blk Num освежается по фактической раскладке .DB (важно после PACK);
+    записи удалённых строк убираются; новые строки вставляются bisect-ом
+    по локальному порядку. Y пересобирается поверх X, заголовки — BDE.
+    """
+    path = Path(db_file).resolve()
+    pairs = secondary_index_pairs(path)
+    if not pairs:
+        return []
+
+    # offsets полей родителя + raw-записи с номерами блоков
+    from pypxlib.pxlib_ctypes import PX_get_field
+
+    t = Table(str(path), encoding=encoding)
+    try:
+        poffs = {}
+        off0 = 0
+        for i, nm in enumerate(t.fields.keys()):
+            f = PX_get_field(t.pxdoc, i).contents
+            poffs[nm] = (off0, int(f.px_flen))
+            off0 += int(f.px_flen)
+    finally:
+        t.close()
+
+    db = path.read_bytes()
+    hs = int.from_bytes(db[2:4], "little")
+    rs = int.from_bytes(db[0:2], "little")
+    bs = db[5] * 1024
+    parent_cp = db[0x6A:0x6C]
+    db_rows: list[tuple[bytes, int]] = []  # (raw record, block#)
+    off = hs
+    blk = 0
+    while off + 6 <= len(db):
+        blk += 1
+        add = int.from_bytes(db[off + 4:off + 6], "little")
+        n = add // rs + 1
+        if add == 0 and not any(db[off + 6:off + 6 + rs]):
+            n = 0
+        for i in range(n):
+            s = off + 6 + i * rs
+            db_rows.append((db[s:s + rs], blk))
+        off += bs
+
+    def upperkey(b: bytes) -> bytes:
+        return b.decode(encoding, "replace").upper().encode(encoding, "replace")
+
+    done: list[Path] = []
+    for x_old, y_old in pairs:
+        schema = _x_file_schema(x_old, encoding=encoding)
+        fields = schema["fields"]
+        key_len_total = sum(fl for _n, _t2, fl in fields[:-1])
+        # ключ каждой живой записи .DB в формате X
+        want: dict[bytes, int] = {}
+        order_new: list[bytes] = []
+        for rec, b_no in db_rows:
+            parts = b""
+            for nm, _ft, fl in fields[:-1]:
+                o, l = poffs.get(nm, (None, None))
+                if o is None:
+                    parts = None
+                    break
+                parts += rec[o:o + l][:fl].ljust(fl, b"\x00")
+            if parts is None:
+                want = None
+                break
+            if parts not in want:
+                order_new.append(parts)
+            want[parts] = b_no
+        if want is None:
+            if log:
+                log(f"  ⚠ {x_old.name}: поле не найдено — полная пересборка")
+            continue
+
+        xb = x_old.read_bytes()
+        xrecs, xhs, xrs, xbs = _raw_records_blocks(xb)
+        merged: list[bytes] = []
+        seen: set[bytes] = set()
+        dropped = updated = 0
+        for r in xrecs:
+            k = r[:key_len_total]
+            b_no = want.get(k)
+            if b_no is None:
+                dropped += 1          # строка удалена из .DB
+                continue
+            nr_ = k + (0x8000 + b_no).to_bytes(2, "big")
+            if nr_ != r:
+                updated += 1
+            merged.append(nr_)
+            seen.add(k)
+        inserted = 0
+        for k in order_new:
+            if k in seen:
+                continue
+            nr_ = k + (0x8000 + want[k]).to_bytes(2, "big")
+            kk = upperkey(k)
+            pos = len(merged)
+            for i, r in enumerate(merged):
+                if upperkey(r[:key_len_total]) > kk:
+                    pos = i
+                    break
+            merged.insert(pos, nr_)
+            inserted += 1
+
+        out = _write_dense_table(xb[:xhs], xhs, xrs, xbs, merged)
+        tmp_x = x_old.parent / (x_old.name + ".upd")
+        tmp_x.write_bytes(out)
+        # кодовая страница X = родителя
+        if parent_cp != b"\x00\x00":
+            xd = bytearray(tmp_x.read_bytes())
+            xd[0x6A:0x6C] = parent_cp
+            tmp_x.write_bytes(bytes(xd))
+        x_old.unlink()
+        tmp_x.rename(x_old)
+        done.append(x_old)
+        if log:
+            log(f"  {x_old.name}: порядок сохранён; +{inserted} −{dropped} "
+                f"blk-обновлено {updated}")
+
+        # Y поверх X
+        y_path = y_old
+        if y_path is None:
+            ext = x_old.suffix
+            y_ext = ((".yg" + ext[3:]) if ext[1:3].lower() == "xg"
+                     else (".y" + ext[2:]))
+            y_path = x_old.with_suffix(y_ext)
+        y_donor = y_path.read_bytes()[:8192] if y_path.exists() else None
+        tmp_y = y_path.parent / (y_path.name + ".upd")
+        if tmp_y.exists():
+            tmp_y.unlink()
+        _write_primary_index_over(
+            x_old, tmp_y, fields[:schema["pk"]], encoding=encoding,
+            maxtablesize=(y_donor[5] if y_donor and 1 <= y_donor[5] <= 32
+                          else 2),
+        )
+        _patch_paradox_header_bytes(
+            tmp_y, sortorder=schema["sortorder"],
+            filetype=(y_donor[4] if y_donor else
+                      (7 if schema["filetype"] == 8 else 4)),
+        )
+        if y_donor is not None and _looks_bde_header(y_donor):
+            _graft_bde_identity(tmp_y, y_donor, str(tmp_y))
+        if y_path.exists():
+            y_path.unlink()
+        tmp_y.rename(y_path)
+        done.append(y_path)
+    return done
+
+
+def _raw_records_blocks(b: bytes):
+    """(records, hs, rs, bs) файла Paradox."""
+    hs = int.from_bytes(b[2:4], "little")
+    rs = int.from_bytes(b[0:2], "little")
+    bs = b[5] * 1024
+    out = []
+    off = hs
+    while off + 6 <= len(b):
+        add = int.from_bytes(b[off + 4:off + 6], "little")
+        n = add // rs + 1
+        if add == 0 and not any(b[off + 6:off + 6 + rs]):
+            n = 0
+        for i in range(n):
+            out.append(b[off + 6 + i * rs:off + 6 + (i + 1) * rs])
+        off += bs
+    return out, hs, rs, bs
+
+
+def _write_dense_table(hdr: bytes, hs: int, rs: int, bs: int,
+                       records: list[bytes]) -> bytes:
+    """Плотная укладка записей: заголовок + блоки цепочкой 1..N + счётчики."""
+    cap = (bs - 6) // rs
+    chunks = [records[i:i + cap] for i in range(0, len(records), cap)] or [[]]
+    out = bytearray(hdr[:hs]) + bytearray(len(chunks) * bs)
+    for i, ch in enumerate(chunks):
+        boff = hs + i * bs
+        out[boff:boff + 2] = (i + 2 if i + 1 < len(chunks) else 0).to_bytes(2, "little")
+        out[boff + 2:boff + 4] = i.to_bytes(2, "little")
+        out[boff + 4:boff + 6] = (max(len(ch) - 1, 0) * rs).to_bytes(2, "little")
+        for j, r in enumerate(ch):
+            s = boff + 6 + j * rs
+            out[s:s + rs] = r
+    n_blocks = len(chunks)
+    out[0x06:0x0A] = len(records).to_bytes(4, "little")
+    out[0x0A:0x0C] = n_blocks.to_bytes(2, "little")
+    out[0x0C:0x0E] = n_blocks.to_bytes(2, "little")
+    out[0x0E:0x10] = (1).to_bytes(2, "little")
+    out[0x10:0x12] = n_blocks.to_bytes(2, "little")
+    out[0x3A:0x3C] = n_blocks.to_bytes(2, "little")
+    return bytes(out)
 
 
 def rebuild_secondary_indexes(
@@ -1239,29 +1443,39 @@ def insert_rows(
         if log:
             log(f"{path.name}: rebuild primary .PX…")
         rebuild_primary_index(path, encoding=encoding)
-        # Secondary: пересборка нативно (.Xnn/.XGn + .Ynn/.YGn); при ошибке —
-        # fallback: карантин в _index_stale/ + Pack в Database Desktop.
+        # Secondary: ИНКРЕМЕНТАЛЬНО с сохранением существующего порядка
+        # X-файлов (исторический порядок BDE у «старых» таблиц —
+        # 1ms_univers и т.п. — формулой не воспроизводится, полная
+        # пересборка ломает поиск UNA). Полная пересборка — fallback.
         if packed or has_sec or any(
             _is_secondary_index_file(p) for p in paradox_secondary_files(path)
         ):
             try:
-                done = rebuild_secondary_indexes(path, encoding=encoding, log=log)
+                done = update_secondary_indexes_incremental(
+                    path, encoding=encoding, log=log)
                 if log and done:
                     log(
-                        f"{path.name}: secondary rebuilt ({len(done)} files) — "
+                        f"{path.name}: secondary обновлены инкрементально "
+                        f"({len(done)} files), порядок сохранён — "
                         f"Database Desktop не требуется."
                     )
             except Exception as exc:
                 if log:
-                    log(f"⚠ {path.name}: secondary rebuild failed ({exc})")
-                if quarantine_secondary:
-                    moved = quarantine_secondary_indexes(path)
-                    if log and moved:
-                        log(
-                            f"{path.name}: secondary → _index_stale/ "
-                            f"({len(moved)} files). ОБЯЗАТЕЛЬНО Pack/Restructure "
-                            f"в Database Desktop перед работой в UNA/1m."
-                        )
+                    log(f"⚠ {path.name}: incremental secondary failed ({exc}) "
+                        f"— полная пересборка")
+                try:
+                    rebuild_secondary_indexes(path, encoding=encoding, log=log)
+                except Exception as exc2:
+                    if log:
+                        log(f"⚠ {path.name}: secondary rebuild failed ({exc2})")
+                    if quarantine_secondary:
+                        moved = quarantine_secondary_indexes(path)
+                        if log and moved:
+                            log(
+                                f"{path.name}: secondary → _index_stale/ "
+                                f"({len(moved)} files). Pack/Restructure в "
+                                f"Database Desktop перед работой в UNA/1m."
+                            )
     elif has_paradox_indexes(path) and not allow_unsafe_indexed_write:
         raise ParadoxIndexWriteError(
             f"Записано {inserted} строк в {path.name}, но индексы не обновлены "
