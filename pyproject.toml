@@ -19,7 +19,7 @@ classifiers = [
 dependencies = ["pypxlib>=2.5"]
 
 [project.urls]
-Homepage = "https://github.com/PavelTuhari/pxbde"
+Homepage = "https://github.com/PavelTuhari/paradox_bde"
 
 [tool.setuptools]
 packages = ["pxbde"]
