@@ -1,0 +1,25 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pxbde"
+version = "1.0.0"
+description = "Safe editing of Paradox (BDE) tables on top of pxlib: BDE-compatible headers, native B-tree index rebuild (.PX/.Xnn/.XGn/.Ynn/.YGn), raw pack"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "Pavel Tuhari" }]
+keywords = ["paradox", "bde", "pxlib", "pypxlib", "dbase", "legacy", "database"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "License :: OSI Approved :: MIT License",
+    "Topic :: Database",
+]
+dependencies = ["pypxlib>=2.5"]
+
+[project.urls]
+Homepage = "https://github.com/PavelTuhari/pxbde"
+
+[tool.setuptools]
+packages = ["pxbde"]
