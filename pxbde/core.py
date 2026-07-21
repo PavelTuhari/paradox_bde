@@ -790,56 +790,118 @@ def mb_append_blobs(
     mb_path: str | Path,
     texts: list[bytes],
     *,
-    modcount: int = 1,
+    db_path: str | Path | None = None,
 ) -> list[tuple[int, int, int]]:
     """
-    Дописывает блобы в .MB новыми suballocated-блоками (type 3) и возвращает
-    для каждого текста (pointer, length, modcount) для 10-байтного blob-инфо
-    записи .DB: [leader(M байт)] [pointer LE4 = file_block_offset|slot]
-    [length LE4] [modcount LE2].
+    Запись блобов в .MB по протоколу BDE (выведен по транзакциям Database
+    Desktop/UNA и подтверждён побайтово):
 
-    Формат type-3 блока (вскрыт по эталону 1MDB_CM.MB):
-      +0: 0x03, +1: 0x01; +12: слот-таблица 64×5 байт
-      [data_off/16][chunks][modcount LE2][len%16]; данные — 16-байтные чанки.
+      * слот-таблица type-3 блока: 64 x 5 байт @+12, слоты занимаются
+        С КОНЦА (0x3F -> вниз); слот = [off/16][chunks][modcount LE2][len%16];
+      * данные — 16-байтные чанки, аллокация с хвоста блока;
+      * байты [3..10] заголовка блока = XOR-чексумма всех 8-байтных слов
+        блока (поле чексуммы при вычислении = нули) — БЕЗ неё BDE даёт
+        "Corrupt Memo/BLOB file";
+      * глобальный modcount в заголовке .MB (word LE @3): каждый блоб
+        получает текущее значение, счётчик инкрементируется;
+      * СИНХРОННЫЙ счётчик в заголовке .DB (word LE @0x74) += число блобов —
+        рассинхрон тоже даёт "Corrupt Memo" (передайте db_path!).
+
+    Возвращает [(pointer, length, modcount)] для make_blob_info().
     """
     p = Path(mb_path)
     mb = bytearray(p.read_bytes())
     while len(mb) % 4096:
         mb.append(0)
-    out: list[tuple[int, int, int]] = []
-    blk_off = None
-    slot_i = 0
-    data_off = 0
+    gmod = int.from_bytes(mb[3:5], "little")
+    nblocks = len(mb) // 4096
 
-    def new_block():
-        nonlocal blk_off, slot_i, data_off
-        blk_off = len(mb)
+    def xor8_cs(block: bytes) -> bytes:
+        data = bytes(block[:3]) + b"\x00" * 8 + bytes(block[11:])
+        acc = bytearray(8)
+        for i in range(0, 4096, 8):
+            for j in range(8):
+                acc[j] ^= data[i + j]
+        return bytes(acc)
+
+    cache: dict[int, dict] = {}
+
+    def state(bo: int) -> dict:
+        if bo in cache:
+            return cache[bo]
+        top = None
+        for i in range(63, -1, -1):
+            if not any(mb[bo + 12 + 5 * i: bo + 12 + 5 * i + 5]):
+                top = i
+                break
+        occ = [c < 21 for c in range(256)]
+        for i in range(64):
+            e = mb[bo + 12 + 5 * i: bo + 12 + 5 * i + 5]
+            if any(e):
+                for c in range(e[0], min(e[0] + e[1], 256)):
+                    occ[c] = True
+        cache[bo] = {"top": top, "occ": occ}
+        return cache[bo]
+
+    def alloc(need: int):
+        nonlocal nblocks
+        for b in range(nblocks - 1, 0, -1):
+            bo = b * 4096
+            if mb[bo] != 3:
+                continue
+            st = state(bo)
+            if st["top"] is None:
+                continue
+            run = 0
+            for c in range(255, 20, -1):
+                run = run + 1 if not st["occ"][c] else 0
+                if run >= need:
+                    slot = st["top"]
+                    for cc in range(c, c + need):
+                        st["occ"][cc] = True
+                    st["top"] = next(
+                        (i for i in range(slot - 1, -1, -1)
+                         if not any(mb[bo + 12 + 5 * i: bo + 12 + 5 * i + 5])),
+                        None)
+                    return bo, slot, c * 16
+        bo = len(mb)
         blk = bytearray(4096)
         blk[0] = 3
         blk[1] = 1
         mb.extend(blk)
-        slot_i = 0
-        data_off = 336  # после 12 + 64*5 = 332, выравнено на 16
+        nblocks += 1
+        st = {"top": 62, "occ": [c < 21 for c in range(256)]}
+        c = 256 - need
+        for cc in range(c, c + need):
+            st["occ"][cc] = True
+        cache[bo] = st
+        return bo, 63, c * 16
 
-    new_block()
+    out: list[tuple[int, int, int]] = []
+    touched: set[int] = set()
     for t in texts:
         ln = len(t)
-        chunks = (ln + 15) // 16
-        if slot_i >= 64 or data_off + chunks * 16 > 4096:
-            new_block()
-        # данные
-        mb[blk_off + data_off: blk_off + data_off + ln] = t
-        # слот
-        so = blk_off + 12 + 5 * slot_i
-        mb[so] = data_off // 16
-        mb[so + 1] = chunks
-        mb[so + 2:so + 4] = modcount.to_bytes(2, "little")
+        ch = (ln + 15) // 16
+        bo, slot, doff = alloc(ch)
+        mb[bo + doff: bo + doff + ln] = t
+        so = bo + 12 + 5 * slot
+        mb[so] = doff // 16
+        mb[so + 1] = ch
+        mb[so + 2: so + 4] = gmod.to_bytes(2, "little")
         mb[so + 4] = ln % 16
-        pointer = blk_off | slot_i
-        out.append((pointer, ln, modcount))
-        slot_i += 1
-        data_off += chunks * 16
+        touched.add(bo)
+        out.append((bo | slot, ln, gmod))
+        gmod += 1
+    for bo in touched:
+        mb[bo + 3: bo + 11] = xor8_cs(mb[bo: bo + 4096])
+    mb[3:5] = gmod.to_bytes(2, "little")
     p.write_bytes(bytes(mb))
+    if db_path is not None:
+        dbp = Path(db_path)
+        db = bytearray(dbp.read_bytes())
+        w = int.from_bytes(db[0x74:0x76], "little")
+        db[0x74:0x76] = (w + len(texts)).to_bytes(2, "little")
+        dbp.write_bytes(bytes(db))
     return out
 
 

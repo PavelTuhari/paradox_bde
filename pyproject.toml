@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "pxbde"
-version = "1.2.0"
+version = "1.3.0"
 description = "Safe editing of Paradox (BDE) tables on top of pxlib: BDE-compatible headers, native B-tree index rebuild (.PX/.Xnn/.XGn/.Ynn/.YGn), raw pack"
 readme = "README.md"
 requires-python = ">=3.10"
