@@ -786,6 +786,73 @@ def _rebuild_px_from_base(px_path: Path, base_path: Path) -> None:
     px_path.write_bytes(bytes(out))
 
 
+def mb_append_blobs(
+    mb_path: str | Path,
+    texts: list[bytes],
+    *,
+    modcount: int = 1,
+) -> list[tuple[int, int, int]]:
+    """
+    Дописывает блобы в .MB новыми suballocated-блоками (type 3) и возвращает
+    для каждого текста (pointer, length, modcount) для 10-байтного blob-инфо
+    записи .DB: [leader(M байт)] [pointer LE4 = file_block_offset|slot]
+    [length LE4] [modcount LE2].
+
+    Формат type-3 блока (вскрыт по эталону 1MDB_CM.MB):
+      +0: 0x03, +1: 0x01; +12: слот-таблица 64×5 байт
+      [data_off/16][chunks][modcount LE2][len%16]; данные — 16-байтные чанки.
+    """
+    p = Path(mb_path)
+    mb = bytearray(p.read_bytes())
+    while len(mb) % 4096:
+        mb.append(0)
+    out: list[tuple[int, int, int]] = []
+    blk_off = None
+    slot_i = 0
+    data_off = 0
+
+    def new_block():
+        nonlocal blk_off, slot_i, data_off
+        blk_off = len(mb)
+        blk = bytearray(4096)
+        blk[0] = 3
+        blk[1] = 1
+        mb.extend(blk)
+        slot_i = 0
+        data_off = 336  # после 12 + 64*5 = 332, выравнено на 16
+
+    new_block()
+    for t in texts:
+        ln = len(t)
+        chunks = (ln + 15) // 16
+        if slot_i >= 64 or data_off + chunks * 16 > 4096:
+            new_block()
+        # данные
+        mb[blk_off + data_off: blk_off + data_off + ln] = t
+        # слот
+        so = blk_off + 12 + 5 * slot_i
+        mb[so] = data_off // 16
+        mb[so + 1] = chunks
+        mb[so + 2:so + 4] = modcount.to_bytes(2, "little")
+        mb[so + 4] = ln % 16
+        pointer = blk_off | slot_i
+        out.append((pointer, ln, modcount))
+        slot_i += 1
+        data_off += chunks * 16
+    p.write_bytes(bytes(mb))
+    return out
+
+
+def make_blob_info(
+    text: bytes, pointer: int, length: int, modcount: int, field_len: int
+) -> bytes:
+    """10+M байт blob-поля записи: leader + pointer + length + modcount."""
+    m = field_len - 10
+    leader = text[:m].ljust(m, b"\x00")
+    return (leader + pointer.to_bytes(4, "little")
+            + length.to_bytes(4, "little") + modcount.to_bytes(2, "little"))
+
+
 def update_secondary_indexes_incremental(
     db_file: str | Path,
     *,

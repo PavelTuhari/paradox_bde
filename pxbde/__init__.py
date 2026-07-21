@@ -28,6 +28,8 @@ from pxbde.core import (
     insert_rows,
     insert_rows_batch_by_table,
     list_tables,
+    make_blob_info,
+    mb_append_blobs,
     pack_paradox_table,
     update_secondary_indexes_incremental,
     paradox_secondary_files,
@@ -37,7 +39,7 @@ from pxbde.core import (
     secondary_index_pairs,
 )
 
-__version__ = "1.1.0"
+__version__ = "1.2.0"
 
 __all__ = [
     "ParadoxIndexWriteError",
@@ -48,6 +50,8 @@ __all__ = [
     "insert_rows",
     "insert_rows_batch_by_table",
     "list_tables",
+    "make_blob_info",
+    "mb_append_blobs",
     "pack_paradox_table",
     "paradox_secondary_files",
     "quarantine_secondary_indexes",
