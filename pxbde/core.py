@@ -969,8 +969,9 @@ def update_secondary_indexes_incremental(
             db_rows.append((db[s:s + rs], blk))
         off += bs
 
-    def upperkey(b: bytes) -> bytes:
-        return b.decode(encoding, "replace").upper().encode(encoding, "replace")
+    # ВАЖНО: сравнение ключей — ТОЛЬКО сырыми байтами. decode/upper
+    # искажает двоичные (числовые) ключи: байт 0xAD ('н' cp866) -> 0x8D,
+    # и bisect кладёт запись не туда — B-дерево BDE её не находит.
 
     done: list[Path] = []
     for x_old, y_old in pairs:
@@ -1020,10 +1021,9 @@ def update_secondary_indexes_incremental(
             if k in seen:
                 continue
             nr_ = k + (0x8000 + want[k]).to_bytes(2, "big")
-            kk = upperkey(k)
             pos = len(merged)
             for i, r in enumerate(merged):
-                if upperkey(r[:key_len_total]) > kk:
+                if r[:key_len_total] > k:
                     pos = i
                     break
             merged.insert(pos, nr_)
