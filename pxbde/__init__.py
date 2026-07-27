@@ -22,6 +22,7 @@ DOS-кодовую страницу), индексы пересобираютс�
 from pxbde.core import (
     ParadoxIndexWriteError,
     check_table,
+    collation_weight_key,
     describe_table,
     ensure_indexdb_primary_key,
     has_paradox_indexes,
@@ -39,11 +40,12 @@ from pxbde.core import (
     secondary_index_pairs,
 )
 
-__version__ = "1.3.1"
+__version__ = "1.4.0"
 
 __all__ = [
     "ParadoxIndexWriteError",
     "check_table",
+    "collation_weight_key",
     "describe_table",
     "ensure_indexdb_primary_key",
     "has_paradox_indexes",

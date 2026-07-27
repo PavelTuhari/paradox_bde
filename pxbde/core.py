@@ -956,10 +956,8 @@ def update_secondary_indexes_incremental(
     bs = db[5] * 1024
     parent_cp = db[0x6A:0x6C]
     db_rows: list[tuple[bytes, int]] = []  # (raw record, block#)
-    off = hs
-    blk = 0
-    while off + 6 <= len(db):
-        blk += 1
+    for blk in _block_chain(db, hs, bs):    # порядок ключа, не файла
+        off = hs + (blk - 1) * bs
         add = int.from_bytes(db[off + 4:off + 6], "little")
         n = add // rs + 1
         if add == 0 and not any(db[off + 6:off + 6 + rs]):
@@ -967,7 +965,6 @@ def update_secondary_indexes_incremental(
         for i in range(n):
             s = off + 6 + i * rs
             db_rows.append((db[s:s + rs], blk))
-        off += bs
 
     # ВАЖНО: сравнение ключей — ТОЛЬКО сырыми байтами. decode/upper
     # искажает двоичные (числовые) ключи: байт 0xAD ('н' cp866) -> 0x8D,
@@ -1016,14 +1013,19 @@ def update_secondary_indexes_incremental(
                 updated += 1
             merged.append(nr_)
             seen.add(k)
+        # вставка по коллации BDE (языковой драйвер): Alpha-поля
+        # регистронезависимо, числовые — сырыми байтами; равные ключи —
+        # в конец серии равных.
+        wkey = collation_weight_key(fields[:-1])
         inserted = 0
         for k in order_new:
             if k in seen:
                 continue
             nr_ = k + (0x8000 + want[k]).to_bytes(2, "big")
+            kw = wkey(k)
             pos = len(merged)
             for i, r in enumerate(merged):
-                if r[:key_len_total] > k:
+                if wkey(r[:key_len_total]) > kw:
                     pos = i
                     break
             merged.insert(pos, nr_)
@@ -1074,21 +1076,77 @@ def update_secondary_indexes_incremental(
     return done
 
 
+# Веса коллации BDE 'cyrr' (cp866): текстовые поля регистронезависимы —
+# a-z=A-Z, а-п(0xA0-0xAF)=А-П(0x80-0x8F), р-я(0xE0-0xEF)=Р-Я(0x90-0x9F),
+# ё(0xF1)=Ё(0xF0); числовые поля (BE+0x8000) сравниваются сырыми байтами.
+_CYRR_W = bytes(
+    (c - 32) if ord('a') <= c <= ord('z') else
+    (c - 0x20) if 0xA0 <= c <= 0xAF else
+    (c - 0x50) if 0xE0 <= c <= 0xEF else
+    (0xF0 if c == 0xF1 else c)
+    for c in range(256)
+)
+
+def collation_weight_key(key_fields):
+    """key(bytes)->bytes: взвешенный ключ X-записи для сравнения по BDE.
+
+    key_fields — [(name, ftype, flen), ...] ключевых полей (без 'Blk Num');
+    Alpha (тип 0x01) взвешивается регистронезависимо, остальные — как есть.
+    """
+    spans = []
+    off = 0
+    for _nm, ft, fl in key_fields:
+        ftv = ft if isinstance(ft, int) else ord(ft)
+        spans.append((off, fl, ftv == 0x01))
+        off += fl
+
+    def wkey(k: bytes) -> bytes:
+        out = bytearray(k)
+        for o, l, is_alpha in spans:
+            if is_alpha:
+                out[o:o + l] = bytes(_CYRR_W[c] for c in k[o:o + l])
+        return bytes(out)
+
+    return wkey
+
+
+def _block_chain(b: bytes, hs: int, bs: int) -> list[int]:
+    """Номера блоков в порядке ЛОГИЧЕСКОЙ цепочки (header@0x0E → next@+0).
+
+    BDE после своих вставок оставляет цепочку не совпадающей с физическим
+    расположением блоков (напр. блок 868 стоит в цепочке 859-м). Читать
+    записи «подряд по файлу» в таком случае — значит переставить их и
+    сломать порядок индекса. Fallback — физический порядок, если цепочка
+    оборвана или покрывает не все блоки.
+    """
+    n_blocks = (len(b) - hs) // bs if bs else 0
+    order: list[int] = []
+    seen: set[int] = set()
+    blk = int.from_bytes(b[0x0E:0x10], "little")
+    while blk and blk not in seen and 1 <= blk <= n_blocks:
+        seen.add(blk)
+        order.append(blk)
+        off = hs + (blk - 1) * bs
+        blk = int.from_bytes(b[off:off + 2], "little")
+    if len(order) != n_blocks:
+        return list(range(1, n_blocks + 1))
+    return order
+
+
 def _raw_records_blocks(b: bytes):
-    """(records, hs, rs, bs) файла Paradox."""
+    """(records, hs, rs, bs) файла Paradox — записи в порядке цепочки блоков."""
     hs = int.from_bytes(b[2:4], "little")
     rs = int.from_bytes(b[0:2], "little")
     bs = b[5] * 1024
     out = []
-    off = hs
-    while off + 6 <= len(b):
+    for blk in _block_chain(b, hs, bs):
+        off = hs + (blk - 1) * bs
         add = int.from_bytes(b[off + 4:off + 6], "little")
         n = add // rs + 1
         if add == 0 and not any(b[off + 6:off + 6 + rs]):
             n = 0
         for i in range(n):
             out.append(b[off + 6 + i * rs:off + 6 + (i + 1) * rs])
-        off += bs
     return out, hs, rs, bs
 
 
