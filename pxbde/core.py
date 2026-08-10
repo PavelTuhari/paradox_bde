@@ -976,16 +976,22 @@ def update_secondary_indexes_incremental(
         fields = schema["fields"]
         key_len_total = sum(fl for _n, _t2, fl in fields[:-1])
         # ключ каждой живой записи .DB в формате X
+        case_mode = x_alpha_case_mode(x_old, encoding=encoding)
+        n_idx = x_indexed_field_count(x_old, encoding=encoding)
         want: dict[bytes, int] = {}
         order_new: list[bytes] = []
         for rec, b_no in db_rows:
             parts = b""
-            for nm, _ft, fl in fields[:-1]:
+            for i_f, (nm, _ft, fl) in enumerate(fields[:-1]):
                 o, l = poffs.get(nm, (None, None))
                 if o is None:
                     parts = None
                     break
-                parts += rec[o:o + l][:fl].ljust(fl, b"\x00")
+                val = rec[o:o + l][:fl].ljust(fl, b"\x00")
+                ftv = _ft if isinstance(_ft, int) else ord(_ft)
+                if case_mode == "upper" and ftv == 0x01 and i_f < n_idx:
+                    val = cp866_upper(val)
+                parts += val
             if parts is None:
                 want = None
                 break
@@ -1087,6 +1093,76 @@ _CYRR_W = bytes(
     for c in range(256)
 )
 
+def cp866_upper(b: bytes) -> bytes:
+    """Верхний регистр по cp866 (правило BDE для case-insensitive индексов)."""
+    return bytes(_CYRR_W[c] for c in b)
+
+
+def x_indexed_field_count(x_path: str | Path, *, encoding: str = "cp866") -> int:
+    """Сколько первых полей X-файла — собственно индексируемые.
+
+    X-запись = [индексируемые поля…, PK родителя…, 'Blk Num'].
+    BDE приводит к верхнему регистру ТОЛЬКО индексируемые поля;
+    PK-часть копируется из родителя как есть.
+    """
+    p = Path(x_path)
+    try:
+        schema = _x_file_schema(p, encoding=encoding)
+        n_all = len(schema["fields"]) - 1          # без 'Blk Num'
+        parent = _parent_db_for_index(p)
+        t = Table(str(parent), encoding=encoding)
+        try:
+            n_pk_parent = int(t.pxdoc.contents.px_head.contents.px_primarykeyfields)
+        finally:
+            t.close()
+        return max(n_all - n_pk_parent, 1)
+    except Exception:
+        return 1
+
+
+def _parent_db_for_index(x_path: Path) -> Path:
+    return next(q for q in x_path.parent.iterdir()
+                if q.stem.lower() == x_path.stem.lower()
+                and q.suffix.lower() == ".db")
+
+
+def x_alpha_case_mode(x_path: str | Path, *, encoding: str = "cp866") -> str:
+    """'upper' | 'as-is' — как X-файл хранит Alpha-часть ключа.
+
+    Часть вторичных индексов объявлена **регистронезависимыми**: BDE
+    физически хранит в них ключ в ВЕРХНЕМ регистре ('ProCredit'→'PROCREDIT'),
+    поэтому запись, добавленная в исходном регистре, не находится спуском
+    по дереву → Corrupt index. Флага в заголовке не нашлось, режим
+    определяется по фактическому содержимому: у upper-индексов строчных
+    букв практически нет (единичные — остатки старых версий BDE).
+    """
+    p = Path(x_path)
+    try:
+        schema = _x_file_schema(p, encoding=encoding)
+        recs, _hs, _rs, _bs = _raw_records_blocks(p.read_bytes())
+    except Exception:
+        return "as-is"
+    n_idx = x_indexed_field_count(p, encoding=encoding)
+    spans = []
+    off = 0
+    for i, (_nm, ft, fl) in enumerate(schema["fields"][:-1]):
+        ftv = ft if isinstance(ft, int) else ord(ft)
+        if ftv == 0x01 and i < n_idx:      # только индексируемые поля
+            spans.append((off, fl))
+        off += fl
+    if not spans or not recs:
+        return "as-is"
+    low = upp = 0
+    for r in recs[:5000]:
+        for o, l in spans:
+            s = bytes(r[o:o + l]).rstrip(b"\x00").decode(encoding, "replace")
+            low += sum(1 for c in s if c.islower())
+            upp += sum(1 for c in s if c.isupper())
+    if low + upp < 20:
+        return "as-is"
+    return "upper" if low / (low + upp) < 0.02 else "as-is"
+
+
 def collation_weight_key(key_fields):
     """key(bytes)->bytes: взвешенный ключ X-записи для сравнения по BDE.
 
@@ -1120,15 +1196,20 @@ def _block_chain(b: bytes, hs: int, bs: int) -> list[int]:
     оборвана или покрывает не все блоки.
     """
     n_blocks = (len(b) - hs) // bs if bs else 0
+    used = int.from_bytes(b[0x0A:0x0C], "little") or n_blocks
+    first = int.from_bytes(b[0x0E:0x10], "little")
+    last = int.from_bytes(b[0x10:0x12], "little")
     order: list[int] = []
     seen: set[int] = set()
-    blk = int.from_bytes(b[0x0E:0x10], "little")
+    blk = first
     while blk and blk not in seen and 1 <= blk <= n_blocks:
         seen.add(blk)
         order.append(blk)
+        if blk == last or len(order) >= used:
+            break                      # дальше — список СВОБОДНЫХ блоков
         off = hs + (blk - 1) * bs
         blk = int.from_bytes(b[off:off + 2], "little")
-    if len(order) != n_blocks:
+    if not order:
         return list(range(1, n_blocks + 1))
     return order
 
@@ -1440,19 +1521,11 @@ def pack_paradox_table(
         blocks[k] = (nxt, recs)
         off += bs
 
-    # обход по цепочке от firstBlock (порядок ключа)
-    first = int.from_bytes(b[14:16], "little") or 1
+    # обход по цепочке от firstBlock СТРОГО до lastBlock: дальше по next
+    # идёт список СВОБОДНЫХ блоков со старыми (удалёнными) записями
     order: list[bytes] = []
-    cur, seen = first, set()
-    while cur and cur in blocks and cur not in seen:
-        seen.add(cur)
-        nxt, recs = blocks[cur]
-        order.extend(recs)
-        cur = nxt
-    if len(seen) != len(blocks):  # обрыв цепочки — добрать физически
-        for k2 in sorted(blocks):
-            if k2 not in seen:
-                order.extend(blocks[k2][1])
+    for blk in _block_chain(b, hs, bs):
+        order.extend(blocks[blk][1])
 
     cap = (bs - 6) // rs
     chunks = [order[i:i + cap] for i in range(0, len(order), cap)] or [[]]

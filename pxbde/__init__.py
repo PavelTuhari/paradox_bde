@@ -23,6 +23,8 @@ from pxbde.core import (
     ParadoxIndexWriteError,
     check_table,
     collation_weight_key,
+    x_alpha_case_mode,
+    cp866_upper,
     describe_table,
     ensure_indexdb_primary_key,
     has_paradox_indexes,
@@ -40,12 +42,14 @@ from pxbde.core import (
     secondary_index_pairs,
 )
 
-__version__ = "1.4.0"
+__version__ = "1.5.0"
 
 __all__ = [
     "ParadoxIndexWriteError",
     "check_table",
     "collation_weight_key",
+    "x_alpha_case_mode",
+    "cp866_upper",
     "describe_table",
     "ensure_indexdb_primary_key",
     "has_paradox_indexes",
