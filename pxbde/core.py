@@ -888,7 +888,8 @@ def mb_append_blobs(
         mb[so] = doff // 16
         mb[so + 1] = ch
         mb[so + 2: so + 4] = gmod.to_bytes(2, "little")
-        mb[so + 4] = ln % 16
+        # остаток длины: при длине, кратной 16, BDE пишет 16, а не 0
+        mb[so + 4] = (ln % 16) or (16 if ln else 0)
         touched.add(bo)
         out.append((bo | slot, ln, gmod))
         gmod += 1
